@@ -1,272 +1,146 @@
 #!/usr/bin/env python3
-import numpy as np
 import rospy
+from std_msgs.msg import String
+from duckietown.dtros import DTROS, NodeType, TopicType
+from duckietown_msgs.msg import Twist2DStamped, LanePose, StopLineReading
 
-from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
-from duckietown_msgs.msg import (
-    Twist2DStamped,
-    LanePose,
-    WheelsCmdStamped,
-    BoolStamped,
-    FSMState,
-    StopLineReading,
-)
-
-from lane_controller.controller import LaneController
-
-
-class LaneControllerNode(DTROS):
-    """Computes control action.
-    The node compute the commands in form of linear and angular velocities, by processing the estimate error in
-    lateral deviationa and heading.
-    The configuration parameters can be changed dynamically while the node is running via ``rosparam set`` commands.
-    Args:
-        node_name (:obj:`str`): a unique, descriptive name for the node that ROS will use
-    Configuration:
-        ~v_bar (:obj:`float`): Nominal velocity in m/s
-        ~k_d (:obj:`float`): Proportional term for lateral deviation
-        ~k_theta (:obj:`float`): Proportional term for heading deviation
-        ~k_Id (:obj:`float`): integral term for lateral deviation
-        ~k_Iphi (:obj:`float`): integral term for lateral deviation
-        ~d_thres (:obj:`float`): Maximum value for lateral error
-        ~theta_thres (:obj:`float`): Maximum value for heading error
-        ~d_offset (:obj:`float`): Goal offset from center of the lane
-        ~integral_bounds (:obj:`dict`): Bounds for integral term
-        ~d_resolution (:obj:`float`): Resolution of lateral position estimate
-        ~phi_resolution (:obj:`float`): Resolution of heading estimate
-        ~omega_ff (:obj:`float`): Feedforward part of controller
-        ~verbose (:obj:`bool`): Verbosity level (0,1,2)
-        ~stop_line_slowdown (:obj:`dict`): Start and end distances for slowdown at stop lines
-
-    Publisher:
-        ~car_cmd (:obj:`Twist2DStamped`): The computed control action
-    Subscribers:
-        ~lane_pose (:obj:`LanePose`): The lane pose estimate from the lane filter
-        ~intersection_navigation_pose (:obj:`LanePose`): The lane pose estimate from intersection navigation
-        ~wheels_cmd_executed (:obj:`WheelsCmdStamped`): Confirmation that the control action was executed
-        ~stop_line_reading (:obj:`StopLineReading`): Distance from stopline, to reduce speed
-        ~obstacle_distance_reading (:obj:`stop_line_reading`): Distancefrom obstacle virtual stopline, to reduce speed
-    """
-
+class SimpleLaneControllerNode(DTROS):
     def __init__(self, node_name):
-
-        # Initialize the DTROS parent class
-        super(LaneControllerNode, self).__init__(
+        super(SimpleLaneControllerNode, self).__init__(
             node_name=node_name,
-            node_type=NodeType.PERCEPTION,
-            fsm_controlled=False
+            node_type=NodeType.CONTROL
         )
 
-        # Add the node parameters to the parameters dictionary
-        # TODO: MAKE TO WORK WITH NEW DTROS PARAMETERS
-        self.params = dict()
-        self.params["~v_bar"] = DTParam("~v_bar", param_type=ParamType.FLOAT, min_value=0.0, max_value=5.0)
-        self.params["~k_d"] = DTParam("~k_d", param_type=ParamType.FLOAT, min_value=-100.0, max_value=100.0)
-        self.params["~k_theta"] = DTParam(
-            "~k_theta", param_type=ParamType.FLOAT, min_value=-100.0, max_value=100.0
-        )
-        self.params["~k_Id"] = DTParam("~k_Id", param_type=ParamType.FLOAT, min_value=-100.0, max_value=100.0)
-        self.params["~k_Iphi"] = DTParam(
-            "~k_Iphi", param_type=ParamType.FLOAT, min_value=-100.0, max_value=100.0
-        )
-        #self.params["~theta_thres"] = rospy.get_param("~theta_thres", None)
-        #Breaking up the self.params["~theta_thres"] parameter for more finer tuning of phi
-        self.params["~theta_thres_min"] = DTParam("~theta_thres_min", param_type=ParamType.FLOAT, min_value=-100.0, max_value=100.0)  #SUGGESTION mandatorizing the use of DTParam inplace of rospy.get_param for parameters in the entire dt-core repository as it allows active tuning while Robot is in action.
-        self.params["~theta_thres_max"] = DTParam("~theta_thres_max", param_type=ParamType.FLOAT, min_value=-100.0, max_value=100.0)
-        self.params["~d_thres"] = rospy.get_param("~d_thres", None)
-        self.params["~d_offset"] = rospy.get_param("~d_offset", None)
-        self.params["~integral_bounds"] = rospy.get_param("~integral_bounds", None)
-        self.params["~d_resolution"] = rospy.get_param("~d_resolution", None)
-        self.params["~phi_resolution"] = rospy.get_param("~phi_resolution", None)
-        self.params["~omega_ff"] = rospy.get_param("~omega_ff", None)
-        self.params["~verbose"] = rospy.get_param("~verbose", None)
-        self.params["~stop_line_slowdown"] = rospy.get_param("~stop_line_slowdown", None)
+        # --- PID waarden (Nu met I!) ---
+        self.v_forward = 0.05
 
-        # Need to create controller object before updating parameters, otherwise it will fail
-        self.controller = LaneController(self.params)
-        # self.updateParameters() # TODO: This needs be replaced by the new DTROS callback when it is implemented
+        # P-Gains (Reageren op de huidige fout)
+        self.k_d = -1.5
+        self.k_phi = -1.0
 
-        # Initialize variables
-        self.fsm_state = None
-        self.wheels_cmd_executed = WheelsCmdStamped()
-        self.pose_msg = LanePose()
-        self.pose_initialized = False
-        self.pose_msg_dict = dict()
-        self.last_s = None
-        self.stop_line_distance = None
-        self.stop_line_detected = False
-        self.at_stop_line = False
-        self.obstacle_stop_line_distance = None
-        self.obstacle_stop_line_detected = False
-        self.at_obstacle_stop_line = False
+        # I-Gains (Reageren op structurele afwijkingen/scheve hardware)
+        # Begin met hele kleine getallen!
+        self.k_i_d = -0.2
+        self.k_i_phi = -0.2
 
-        self.current_pose_source = "lane_filter"
+        # --- State Variables ---
+        self.state = "LANE_FOLLOWING"
+        self.ignore_stop_line_until = rospy.Time.now()
+        self.cross_end_time = rospy.Time.now()
 
-        # Construct publishers
+        # --- Integrale Geheugen Variabelen ---
+        self.integral_d = 0.0
+        self.integral_phi = 0.0
+        self.last_time = None
+
+        # Snelheden voor het oversteken
+        self.cross_v = 0.0
+        self.cross_omega = 0.0
+
+        # --- Publishers ---
         self.pub_car_cmd = rospy.Publisher(
             "~car_cmd", Twist2DStamped, queue_size=1, dt_topic_type=TopicType.CONTROL
         )
 
-        # Construct subscribers
-        self.sub_lane_reading = rospy.Subscriber(
-            "~lane_pose", LanePose, self.cbAllPoses, "lane_filter", queue_size=1
-        )
-        self.sub_intersection_navigation_pose = rospy.Subscriber(
-            "~intersection_navigation_pose",
-            LanePose,
-            self.cbAllPoses,
-            "intersection_navigation",
-            queue_size=1,
-        )
-        self.sub_wheels_cmd_executed = rospy.Subscriber(
-            "~wheels_cmd", WheelsCmdStamped, self.cbWheelsCmdExecuted, queue_size=1
-        )
-        self.sub_stop_line = rospy.Subscriber(
-            "~stop_line_reading", StopLineReading, self.cbStopLineReading, queue_size=1
-        )
-        self.sub_obstacle_stop_line = rospy.Subscriber(
-            "~obstacle_distance_reading", StopLineReading, self.cbObstacleStopLineReading, queue_size=1
-        )
+        # --- Subscribers ---
+        self.sub_lane_pose = rospy.Subscriber("~lane_pose", LanePose, self.cb_lane_pose, queue_size=1)
 
-        self.log("Initialized!")
+        veh_namespace = rospy.get_namespace()
+        stop_line_topic = f"{veh_namespace}stop_line_filter_node/stop_line_reading"
+        self.sub_stop_line = rospy.Subscriber(stop_line_topic, StopLineReading, self.cb_stop_line, queue_size=1)
+        self.sub_cmd = rospy.Subscriber("~command", String, self.cb_command, queue_size=1)
 
-    def cbObstacleStopLineReading(self, msg):
-        """
-        Callback storing the current obstacle distance, if detected.
+        self.log("Simple PI-Controller Initialized! Ready to learn and follow.")
 
-        Args:
-            msg(:obj:`StopLineReading`): Message containing information about the virtual obstacle stopline.
-        """
-        self.obstacle_stop_line_distance = np.sqrt(msg.stop_pose.x**2 + msg.stop_pose.y**2)
-        self.obstacle_stop_line_detected = msg.stop_line_detected
-        self.at_stop_line = msg.at_stop_line
-        if not self.obstacle_stop_line_detected:
-            self.obstacle_stop_line_distance = None
+    def cb_stop_line(self, msg):
+        if msg.at_stop_line and self.state == "LANE_FOLLOWING":
+            if rospy.Time.now() > self.ignore_stop_line_until:
+                self.log("Red line detected! Stopping...")
+                self.state = "STOPPED"
+                self.stop_robot()
 
+    def cb_command(self, msg):
+        command = msg.data.lower()
+        if self.state == "STOPPED" and command in ["straight", "left", "right"]:
+            if command == "straight":
+                self.cross_v = 0.04
+                self.cross_omega = 0.0
+                cross_duration = 2.0
+            elif command == "left":
+                self.cross_v = 0.04
+                self.cross_omega = 1.0
+                cross_duration = 2.0
+            elif command == "right":
+                self.cross_v = 0.04
+                self.cross_omega = -1.0
+                cross_duration = 2.0
 
-    def cbStopLineReading(self, msg):
-        """Callback storing current distance to the next stopline, if one is detected.
+            self.state = "CROSSING"
+            self.cross_end_time = rospy.Time.now() + rospy.Duration(cross_duration)
+            self.ignore_stop_line_until = rospy.Time.now() + rospy.Duration(cross_duration + 2.0)
 
-        Args:
-            msg (:obj:`StopLineReading`): Message containing information about the next stop line.
-        """
-        self.stop_line_distance = -msg.stop_pose.x
-        self.stop_line_detected = msg.stop_line_detected
-        self.at_obstacle_stop_line = msg.at_stop_line
-        if not self.stop_line_detected:
-            self.stop_line_distance = None
+            # Reset de integralen bij een nieuw kruispunt, zodat hij met een schone lei begint
+            self.integral_d = 0.0
+            self.integral_phi = 0.0
 
+    def cb_lane_pose(self, msg):
+        current_time = rospy.Time.now()
 
-    def cbMode(self, fsm_state_msg):
+        if self.last_time is None:
+            self.last_time = current_time
+            return
 
-        self.fsm_state = fsm_state_msg.state  # String of current FSM state
+        # Bereken tijdsverschil (dt) voor de integraal
+        dt = (current_time - self.last_time).to_sec()
+        self.last_time = current_time
 
-        if self.fsm_state == "INTERSECTION_CONTROL":
-            self.current_pose_source = "intersection_navigation"
-        else:
-            self.current_pose_source = "lane_filter"
+        if self.state == "STOPPED":
+            self.stop_robot()
+            return
 
-        if self.params["~verbose"] == 2:
-            self.log("Pose source: %s" % self.current_pose_source)
-
-    def cbAllPoses(self, input_pose_msg, pose_source):
-        """Callback receiving pose messages from multiple topics.
-
-        If the source of the message corresponds with the current wanted pose source, it computes a control command.
-
-        Args:
-            input_pose_msg (:obj:`LanePose`): Message containing information about the current lane pose.
-            pose_source (:obj:`String`): Source of the message, specified in the subscriber.
-        """
-
-        if pose_source == self.current_pose_source:
-            self.pose_msg_dict[pose_source] = input_pose_msg
-
-            self.pose_msg = input_pose_msg
-
-            self.getControlAction(self.pose_msg)
-
-    def cbWheelsCmdExecuted(self, msg_wheels_cmd):
-        """Callback that reports if the requested control action was executed.
-
-        Args:
-            msg_wheels_cmd (:obj:`WheelsCmdStamped`): Executed wheel commands
-        """
-        self.wheels_cmd_executed = msg_wheels_cmd
-
-    def publishCmd(self, car_cmd_msg):
-        """Publishes a car command message.
-
-        Args:
-            car_cmd_msg (:obj:`Twist2DStamped`): Message containing the requested control action.
-        """
-        self.pub_car_cmd.publish(car_cmd_msg)
-
-    def getControlAction(self, pose_msg):
-        """Callback that receives a pose message and updates the related control command.
-
-        Using a controller object, computes the control action using the current pose estimate.
-
-        Args:
-            pose_msg (:obj:`LanePose`): Message containing information about the current lane pose.
-        """
-        current_s = rospy.Time.now().to_sec()
-        dt = None
-        if self.last_s is not None:
-            dt = current_s - self.last_s
-
-        if self.at_stop_line or self.at_obstacle_stop_line:
-            v = 0
-            omega = 0
-        else:
-
-            # Compute errors
-            d_err = pose_msg.d - self.params["~d_offset"]
-            phi_err = pose_msg.phi
-
-            # We cap the error if it grows too large
-            if np.abs(d_err) > self.params["~d_thres"]:
-                d_err = np.sign(d_err) * self.params["~d_thres"]
-
-            if phi_err > self.params["~theta_thres_max"].value or phi_err < self.params["~theta_thres_min"].value:
-                phi_err = np.maximum(self.params["~theta_thres_min"].value, np.minimum(phi_err, self.params["~theta_thres_max"].value))
-
-            wheels_cmd_exec = [self.wheels_cmd_executed.vel_left, self.wheels_cmd_executed.vel_right]
-            if self.obstacle_stop_line_detected:
-                v, omega = self.controller.compute_control_action(
-                    d_err, phi_err, dt, wheels_cmd_exec, self.obstacle_stop_line_distance
-                )
-                # TODO: This is a temporarily fix to avoid vehicle image detection latency caused unable to stop in time.
-                v = v * 0.25
-                omega = omega * 0.25
-
+        if self.state == "CROSSING":
+            if rospy.Time.now() < self.cross_end_time:
+                car_cmd = Twist2DStamped()
+                car_cmd.header = msg.header
+                car_cmd.v = self.cross_v
+                car_cmd.omega = self.cross_omega
+                self.pub_car_cmd.publish(car_cmd)
+                return
             else:
-                v, omega = self.controller.compute_control_action(
-                    d_err, phi_err, dt, wheels_cmd_exec, self.stop_line_distance
-                )
+                self.state = "LANE_FOLLOWING"
 
-            # For feedforward action (i.e. during intersection navigation)
-            omega += self.params["~omega_ff"]
+        # --- PI Controller Wiskunde ---
+        d_err = msg.d
+        phi_err = msg.phi
 
-        # Initialize car control msg, add header from input message
-        car_control_msg = Twist2DStamped()
-        car_control_msg.header = pose_msg.header
+        # Bouw het geheugen (integraal) op
+        self.integral_d += d_err * dt
+        self.integral_phi += phi_err * dt
 
-        # Add commands to car message
-        car_control_msg.v = v
-        car_control_msg.omega = omega
+        # Anti-Windup: Zorg dat het geheugen niet oneindig groot wordt als je hem oppakt
+        max_integral = 1.0
+        self.integral_d = max(min(self.integral_d, max_integral), -max_integral)
+        self.integral_phi = max(min(self.integral_phi, max_integral), -max_integral)
 
-        self.publishCmd(car_control_msg)
-        self.last_s = current_s
+        # Bereken de uiteindelijke stuurhoek met P en I
+        omega_p = (self.k_d * d_err) + (self.k_phi * phi_err)
+        omega_i = (self.k_i_d * self.integral_d) + (self.k_i_phi * self.integral_phi)
 
-    def cbParametersChanged(self):
-        """Updates parameters in the controller object."""
+        omega = omega_p + omega_i
 
-        self.controller.update_parameters(self.params)
+        car_cmd = Twist2DStamped()
+        car_cmd.header = msg.header
+        car_cmd.v = self.v_forward
+        car_cmd.omega = omega
 
+        self.pub_car_cmd.publish(car_cmd)
+
+    def stop_robot(self):
+        car_cmd = Twist2DStamped()
+        car_cmd.v = 0.0
+        car_cmd.omega = 0.0
+        self.pub_car_cmd.publish(car_cmd)
 
 if __name__ == "__main__":
-    # Initialize the node
-    lane_controller_node = LaneControllerNode(node_name="lane_controller_node")
-    # Keep it spinning
+    node = SimpleLaneControllerNode("lane_controller_node")
     rospy.spin()

@@ -1,6 +1,6 @@
 # Initial state of the FSM
 
-initial_state: "NORMAL_JOYSTICK_CONTROL"
+initial_state: "LANE_FOLLOWING"
 
 
 events: # Maps from subscribing topic to signal ids
@@ -21,6 +21,7 @@ nodes:
   ground_projection_node: "ground_projection_node/switch"
   lane_controller_node: "lane_controller_node/switch"
   led_emitter_node: "led_emitter_node/switch"
+  stop_line_filter_node: "stop_line_filter_node/switch"
   # extras added
 
 
@@ -47,4 +48,5 @@ states:
       - ground_projection_node
       - lane_controller_node
       - led_emitter_node
+      - stop_line_filter_node
     lights: "CAR_DRIVING"
